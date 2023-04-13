@@ -25,6 +25,7 @@ will yield same object graph as the original function.
 import ast
 import builtins
 import dataclasses
+import uuid, os, importlib
 import functools
 import inspect
 import linecache
@@ -329,7 +330,7 @@ def _wrap_ast_for_fn_with_closure_vars(
   ast_none = ast.Constant(value=None)
   closure_var_definitions = [
       ast.Assign(targets=[ast_name(var_name)], value=ast_none)
-      for var_name in fn.__code__.co_freevars + (_CALL_HANDLER_ID,)
+      for var_name in (fn.__code__.co_freevars if fn is not None else ()) + (_CALL_HANDLER_ID,)
   ]
 
   wrapper_module = ast.Module(
@@ -373,7 +374,8 @@ def _unwrap_code_for_fn(code: types.CodeType, fn: types.FunctionType):
     The code object corresponding to `fn`.
   """
   code = _find_function_code(code, _CLOSURE_WRAPPER_ID)
-  code = _find_function_code(code, fn.__name__)
+  if fn is not None:
+    code = _find_function_code(code, fn.__name__)
   return code
 
 
@@ -730,6 +732,57 @@ def auto_config(
     return make_auto_config
   else:
     return make_auto_config(fn)
+
+
+def import_file(file, experimental_allow_control_flow=True):
+  filename = file.name
+  source = file.read()
+  node_transformer = _AutoConfigNodeTransformer(
+      source=source,
+      filename=filename,
+      line_number=1,
+      allow_control_flow=experimental_allow_control_flow)
+  
+  # Identical to the other auto_config_call_handler.
+  def auto_config_call_handler(fn_or_cls, *args, **kwargs):
+    if isinstance(fn_or_cls, AutoConfig) and fn_or_cls.always_inline:
+      return fn_or_cls.as_buildable(*args, **kwargs)
+    if fn_or_cls is functools.partial:
+      return _make_partial(args[0], *args[1:], **kwargs)
+    elif fn_or_cls is arg_factory.partial:
+      return _make_partial(
+          args[0],
+          *[_convert_callable_to_fiddle_arg_factory(arg) for arg in args[1:]],
+          **{
+              name: _convert_callable_to_fiddle_arg_factory(arg)
+              for name, arg in kwargs.items()
+          },
+      )
+
+    if fn_or_cls is exempt:
+      return fn_or_cls(*args, **kwargs)
+    # if experimental_exemption_policy(fn_or_cls):
+      # return fn_or_cls(*args, **kwargs)
+    return config.Config(fn_or_cls, *args, **kwargs)
+
+  node = ast.parse(source)
+  node = node_transformer.visit(node)
+  node = ast.fix_missing_locations(node)
+  assert isinstance(node, ast.Module)
+  code = compile(node, filename, 'exec')
+
+  # Create a fake module
+  def _random_package_name(filename):
+    # generate a random package name when loading config files
+    return "fiddle_fake_module" + str(uuid.uuid4())[:4] + "." + os.path.basename(filename)
+  spec = importlib.machinery.ModuleSpec(
+      _random_package_name(filename), None, origin=filename
+  )
+  module = importlib.util.module_from_spec(spec)
+  module.__file__ = filename
+  module.__dict__[_CALL_HANDLER_ID] = auto_config_call_handler
+  exec(code, module.__dict__)
+  return module
 
 
 def auto_unconfig(
